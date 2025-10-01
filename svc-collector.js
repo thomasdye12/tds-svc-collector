@@ -77,6 +77,26 @@ function makeRequestId() {
   return crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString("hex");
 }
 
+// pending requests waiting for agent replies: id -> { resolve, reject, timer }
+const pending = new Map();
+
+function waitForReply(id, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error("timeout waiting for agent reply"));
+    }, Math.max(1000, timeoutMs));
+    pending.set(id, { resolve: (v) => { clearTimeout(timer); pending.delete(id); resolve(v); },
+                      reject:  (e) => { clearTimeout(timer); pending.delete(id); reject(e); }});
+  });
+}
+
+function tryResolvePending(id, payload) {
+  const p = pending.get(id);
+  if (p) p.resolve(payload);
+}
+
+
 // ------------------------- Public server (WS + optional /ingest) -------------------------
 const publicApp = express();
 // Only mount /ingest if enabled (legacy HTTP push)
@@ -195,6 +215,11 @@ wss.on("connection", (ws, req) => {
           // generic ack from agents
           break;
         }
+        case "installResult": {
+          // { type:"installResult", id, ok, stdout?, error? }
+          if (msg.id) tryResolvePending(msg.id, msg);
+          break;
+        }
 
         default:
           // unknown message types are ignored
@@ -301,6 +326,31 @@ if (ADMIN_ENABLE) {
       return res.status(500).json({ error: "send-failed", detail: e.message });
     }
   });
+
+  adminApp.post("/admin/hosts/:id/run-install", async (req, res) => {
+    const sysId = req.params.id;
+    const client = clients.get(sysId);
+    if (!client || client.ws.readyState !== 1) return res.status(404).json({ error: "offline" });
+  
+    const args = Array.isArray(req.body?.args) ? req.body.args : [];
+    const restart = !!req.body?.restart;
+    const timeoutMs = Number(req.body?.timeoutMs || 15000);
+    const env = (req.body?.env && typeof req.body.env === "object") ? req.body.env : {};
+  
+    const id = makeRequestId();
+    const payload = { type: "runInstall", id, args, restart, env };
+  
+    try { client.ws.send(JSON.stringify(payload)); }
+    catch (e) { return res.status(500).json({ error: "send-failed", detail: e.message }); }
+  
+    try {
+      const reply = await waitForReply(id, timeoutMs);
+      return res.json({ ok: !!reply.ok, reply });
+    } catch (e) {
+      return res.status(504).json({ error: "timeout", detail: e.message, id });
+    }
+  });
+
 
   const adminServer = http.createServer(adminApp);
   adminServer.listen(ADMIN_PORT, ADMIN_BIND, () => {
